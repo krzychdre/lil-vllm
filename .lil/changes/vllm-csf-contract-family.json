@@ -1,0 +1,19 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-csf-contract-family",
+  "category": "fix",
+  "summary": "The FP4-CSF contract reader takes the model family from the top-level model_type of multimodal configs",
+  "models": [
+    "DeepSeek-V4.1-Flash",
+    "DeepSeek-V4-Flash"
+  ],
+  "compatibility": "No user action required.",
+  "details": [
+    "DeepSeek's multimodal config.json names the model at the top (deepseek_v41) and its text tower in text_config (deepseek_v41_text). The CSF contract reader looked at text_config first and stopped with \"CSF config must name a supported model family\" for such checkpoints; it now prefers the top-level model_type and falls back to text_config."
+  ],
+  "pull_requests": [],
+  "requires": [],
+  "authors": [
+    "voipmonitor"
+  ]
+}

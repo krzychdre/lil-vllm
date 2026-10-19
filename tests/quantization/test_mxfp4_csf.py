@@ -425,6 +425,33 @@ def test_csf_contract_rejects_invalid_encoding_and_index(tmp_path, fault):
         reader.checkpoint_contract(str(tmp_path))
 
 
+def test_csf_contract_takes_the_family_from_the_top_level_model_type(tmp_path):
+    """DeepSeek's multimodal configs name the model at the top (deepseek_v41)
+    and the text tower in text_config (deepseek_v41_text); the contract's
+    family is the model's, whichever section carries quantization_config."""
+    from vllm.model_executor.model_loader import mxfp4_csf_loader as reader
+
+    write_index(tmp_path, {"weight": None}, "weights.safetensors", "deepseek_v41")
+    config = json.loads((tmp_path / "config.json").read_text())
+    config["text_config"] = {"model_type": "deepseek_v41_text"}
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    assert reader.checkpoint_contract(str(tmp_path))["family"] == "deepseek_v41"
+
+    # checkpoint_contract caches by root; the nested variant gets its own.
+    nested_root = tmp_path / "nested"
+    nested_root.mkdir()
+    write_index(nested_root, {"weight": None}, "weights.safetensors", "deepseek_v4")
+    nested = {
+        "model_type": "deepseek_v4",
+        "text_config": {
+            "model_type": "deepseek_v4_text",
+            "quantization_config": config["quantization_config"],
+        },
+    }
+    (nested_root / "config.json").write_text(json.dumps(nested))
+    assert reader.checkpoint_contract(str(nested_root))["family"] == "deepseek_v4_flash"
+
+
 def test_csf_tensor_reader_resolves_separate_shards_and_closes_after_failure(
     tmp_path, monkeypatch
 ):

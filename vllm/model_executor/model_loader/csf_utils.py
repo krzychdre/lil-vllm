@@ -70,7 +70,9 @@ def read_csf_contract(root, *, families):
         raise ValueError(
             f"CSF requires weight_scale_encoding='csf' or {CSF_ENCODING!r}"
         )
-    model_type = text.get("model_type", config.get("model_type"))
+    # A multimodal config names the model at the top (deepseek_v41) and its
+    # text tower in text_config (deepseek_v41_text); the family is the model's.
+    model_type = config.get("model_type") or text.get("model_type")
     family = {
         "deepseek_v4_1": "deepseek_v41",
         "deepseek_v4": "deepseek_v4_flash",
