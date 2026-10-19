@@ -133,8 +133,10 @@ class CsfTensorReader(ExitStack):
                 self._handle(prefix + name).get_tensor(prefix + name)
                 for name in ("fixed", "exceptions")
             )
+            # One slab segment: 16-row groups of 16 base bytes plus the packed
+            # scale bits, stored flat in the checkpoint.
             plane = CsfSource(
-                (fixed[None], exceptions),
+                (fixed.view(1, rows // 16, -1), exceptions),
                 torch.tensor([0, exceptions.numel()], dtype=torch.int64),
                 rows,
                 columns,

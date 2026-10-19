@@ -508,6 +508,48 @@ def test_csf_tensor_reader_resolves_separate_shards_and_closes_after_failure(
     )
 
 
+def test_csf_tensor_reader_shapes_slab_scales_for_the_source(tmp_path):
+    """A container stores one projection's slab scales flat; the reader must
+    hand them to CsfSource as one segment of 16-row groups."""
+    from vllm.model_executor.model_loader import csf_utils
+
+    rows, columns = 64, 160
+    rng = np.random.default_rng(5)
+    bases = rng.integers(0, 254, (rows // 16, 16), dtype=np.uint8)
+    bits = rng.integers(0, 2, (rows, columns), dtype=np.uint8)
+    fixed = np.concatenate(
+        (bases, np.packbits(bits, axis=1, bitorder="little").reshape(rows // 16, -1)),
+        1,
+    ).reshape(-1)
+    exceptions = (np.array([3, 700], dtype=np.uint32) | np.uint32(200) << 24).astype(
+        np.uint32
+    )
+    weight = torch.zeros((rows, columns * 32 // 2), dtype=torch.int8)
+    tensors = tmp_path / "tensors"
+    tensors.mkdir()
+    save_file(
+        {
+            "w.weight": weight,
+            "w.scale.mxfp4_csf_fixed": torch.from_numpy(fixed),
+            "w.scale.mxfp4_csf_exceptions": torch.from_numpy(exceptions),
+        },
+        tensors / "shard.safetensors",
+    )
+    index = {
+        name: "tensors/shard.safetensors"
+        for name in ("w.weight", "w.scale.mxfp4_csf_fixed", "w.scale.mxfp4_csf_exceptions")
+    }
+    with csf_utils.CsfTensorReader(tmp_path, index, "mxfp4") as reader:
+        source = reader.matrix("w.weight", "w.scale")
+    plane = source.scales
+    assert plane.encoding == "csf" and plane.segments == 1
+    assert plane.components[0].shape == (1, rows // 16, 16 * (1 + (columns + 7) // 8))
+    assert np.array_equal(plane.components[0].numpy().reshape(-1), fixed)
+    assert np.array_equal(plane.components[1].numpy(), exceptions)
+    assert torch.equal(plane.starts, torch.tensor([0, 2], dtype=torch.int64))
+    assert plane.source_rows == rows and plane.source_columns == columns
+
+
 def decode(fixed, exceptions, rows, columns):
     selectors = (columns + 7) // 8
     stream = fixed.numpy().reshape(rows // 16, 16 * (1 + selectors))
