@@ -19,17 +19,39 @@ implementation's HPC/TPCP fusion paths, which depend on infrastructure that
 does not exist in this tree.
 """
 
-from vllm.platforms import current_platform
+from importlib import import_module
+from typing import TYPE_CHECKING, Any
 
-if current_platform.is_xpu():
-    raise NotImplementedError("hy_v4 does not yet support XPU.")
-else:
-    # The implementation is shared by CUDA and ROCm; platform-specific
-    # attention behavior is selected by the normal attention backend router.
+if TYPE_CHECKING:
     from .nvidia.model import HYV4ForCausalLM
     from .nvidia.mtp import HYV4MTP
+    from .nvidia.vl_model import HYV4VLForConditionalGeneration
 
 __all__ = [
     "HYV4ForCausalLM",
     "HYV4MTP",
+    "HYV4VLForConditionalGeneration",
 ]
+
+
+def __getattr__(name: str) -> Any:
+    """Load model code only when requested, keeping config-only imports light."""
+    if name not in __all__:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+    from vllm.platforms import current_platform
+
+    if current_platform.is_xpu():
+        raise NotImplementedError("hy_v4 does not yet support XPU.")
+    modules = {
+        # Shared by CUDA and ROCm; the attention backend router picks the
+        # platform-specific behavior.
+        "HYV4ForCausalLM": ".nvidia.model",
+        "HYV4MTP": ".nvidia.mtp",
+        "HYV4VLForConditionalGeneration": (
+            ".nvidia.vl_model" if current_platform.is_cuda_alike() else ".vl_stub"
+        ),
+    }
+    model_cls = getattr(import_module(modules[name], __name__), name)
+    globals()[name] = model_cls
+    return model_cls
