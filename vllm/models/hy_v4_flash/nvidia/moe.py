@@ -5,11 +5,17 @@
 import torch
 from torch import nn
 
+from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.linear import ReplicatedLinear
+from vllm.model_executor.layers.linear import (
+    ReplicatedLinear,
+    UnquantizedLinearMethod,
+)
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.models.hy_v4.nvidia.moe import HYV4FeedForward, HYV4MoEFused
 from vllm.models.hy_v4_flash.configs import HYV4FlashConfig
+
+logger = init_logger(__name__)
 
 
 class HYV4FlashFeedForward(HYV4FeedForward):
@@ -72,6 +78,17 @@ class HYV4FlashMoE(HYV4MoEFused):
         )
         self.routed_expert_down_proj = down
         self.routed_expert_up_proj = up
+        if up is not None:
+            # A bias-free unquantized linear commutes with the TP sum
+            # (sum_r W x_r == W sum_r x_r): the latent partials skip their own
+            # all-reduce and are summed once with the shared expert after it.
+            up.reduce_commutative = isinstance(up.quant_method, UnquantizedLinearMethod)
+            logger.info_once(
+                "HYV4 Flash MoE: latent output projection %s the TP sum "
+                "(%d all-reduce per MoE layer)",
+                "commutes with" if up.reduce_commutative else "does not commute with",
+                1 if up.reduce_commutative else 2,
+            )
         self.combine_output_norm = (
             RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
             if config.sandwich_norm
