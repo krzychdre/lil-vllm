@@ -378,6 +378,55 @@ def _read_table_rows(destination, source, start):
             offset += count
 
 
+# --- fast-boot overlay (karmic_ds41f/overlay/fast-boot) -----------------------
+# The two Engram tables sit in separate checkpoint files (on separate NVMe
+# drives here) and were read one after the other. Reads now run on background
+# threads, so both tables load at once; everything that consumes a table first
+# waits for them. ENGRAM_PARALLEL_TABLE_READ=0 restores the sequential read.
+_TABLE_READS: list = []
+_TABLE_READ_POOL = None
+
+
+def _start_table_read(destination, source, start):
+    import os
+    from concurrent.futures import ThreadPoolExecutor
+
+    global _TABLE_READ_POOL
+    if os.environ.get("ENGRAM_PARALLEL_TABLE_READ", "1") == "0":
+        _read_table_rows(destination, source, start)
+        return
+    if _TABLE_READ_POOL is None:
+        _TABLE_READ_POOL = ThreadPoolExecutor(
+            max_workers=4, thread_name_prefix="engram-table"
+        )
+    _TABLE_READS.append(
+        _TABLE_READ_POOL.submit(_read_table_rows, destination, source, start)
+    )
+
+
+def wait_for_table_reads():
+    """Block until every started table read has finished; re-raise its error."""
+    import time
+
+    global _TABLE_READ_POOL
+    if not _TABLE_READS:
+        return
+    started = time.perf_counter()
+    count = len(_TABLE_READS)
+    try:
+        while _TABLE_READS:
+            _TABLE_READS.pop().result()
+    finally:
+        pool, _TABLE_READ_POOL = _TABLE_READ_POOL, None
+        if pool is not None:
+            pool.shutdown(wait=True)
+    logger.info(
+        "Engram table reads finished: waited %.1f s for %d background reads",
+        time.perf_counter() - started,
+        count,
+    )
+
+
 def _load_table(param, loaded_weight):
     source = get_file_tensor_source(loaded_weight)
     shape = source.shape if source is not None else loaded_weight.shape
@@ -398,7 +447,7 @@ def _load_table(param, loaded_weight):
         destination[count:].zero_()
     if count:
         if source is not None:
-            _read_table_rows(destination[:count], source, start)
+            _start_table_read(destination[:count], source, start)
         else:
             copy_weight(
                 destination[:count].view(torch.uint8),
@@ -593,6 +642,8 @@ class ParallelEngramEmbedding(nn.Module):
         return self._disk_binding
 
     def lookup_native(self, indices, out):
+        if _TABLE_READS:
+            wait_for_table_reads()
         if self.plan.prepared is None:
             raise PreparationResourceUnavailableError(
                 "Engram lookup plan must be prepared before forwarding"
@@ -828,6 +879,7 @@ class Engram(nn.Module):
         )
 
     def process_weights_after_loading(self):
+        wait_for_table_reads()
         self.norm_weights.copy_(
             (self.q_weight.float() * self.k_weight.float()).flatten()
         )
