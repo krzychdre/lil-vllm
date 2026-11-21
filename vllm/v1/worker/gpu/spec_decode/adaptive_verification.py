@@ -26,6 +26,85 @@ from vllm.v1.worker.gpu.attn_utils import (
 logger = init_logger(__name__)
 _PROFILE_REPLAYS = 5
 
+# --- fast-boot overlay (karmic_ds41f/overlay/fast-boot) -----------------------
+# The measured cost curves depend only on the model, the captured shapes and the
+# hardware, yet every boot re-measures them with five rounds of dummy steps
+# (~11 s here). Rank 0 stores them under VLLM_CACHE_ROOT (already keyed by image
+# and profile) and later boots with the same shapes reuse them; the warm-up
+# round still runs. DSPARK_COST_CURVE_CACHE=0 restores measuring on every boot.
+_COST_CURVE_SCHEMA = 1
+
+
+def _cost_curve_cache_path(key_fields: dict) -> str | None:
+    import hashlib
+    import json
+    import os
+
+    if os.environ.get("DSPARK_COST_CURVE_CACHE", "1") == "0":
+        return None
+    digest = hashlib.sha256(
+        json.dumps(key_fields, sort_keys=True).encode()
+    ).hexdigest()[:16]
+    return os.path.join(
+        envs.VLLM_CACHE_ROOT, "dspark_cost_curves", f"cost_curves_{digest}.json"
+    )
+
+
+def _load_cost_curves(path: str | None):
+    import json
+
+    if path is None:
+        return None
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        if data.get("schema") != _COST_CURVE_SCHEMA:
+            return None
+        draft = [(int(k), float(v)) for k, v in data["draft_curve"]]
+        verify = [(int(k), float(v)) for k, v in data["verify_curve"]]
+        by_reqs = {
+            int(reqs): [(int(k), float(v)) for k, v in curve]
+            for reqs, curve in data["verify_curves_by_num_reqs"].items()
+        }
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        logger.warning("Ignoring unreadable DSpark cost curves %s: %s", path, exc)
+        return None
+    if not draft or not verify:
+        return None
+    return draft, verify, by_reqs
+
+
+def _save_cost_curves(path: str | None, curves) -> None:
+    import json
+    import os
+
+    if path is None or curves is None:
+        return
+    draft, verify, by_reqs = curves
+    try:
+
+        def plain(curve):
+            return [[int(k), float(v)] for k, v in curve]
+
+        payload = {
+            "schema": _COST_CURVE_SCHEMA,
+            "draft_curve": plain(draft),
+            "verify_curve": plain(verify),
+            "verify_curves_by_num_reqs": {
+                str(int(k)): plain(v) for k, v in (by_reqs or {}).items()
+            },
+        }
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.tmp.{os.getpid()}"
+        with open(tmp, "w") as f:
+            json.dump(payload, f)
+        os.replace(tmp, path)
+        logger.info("Saved DSpark cost curves to %s", path)
+    except (OSError, TypeError, ValueError) as exc:
+        logger.warning("Failed to save DSpark cost curves to %s: %s", path, exc)
+
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.v1.worker.gpu.attn_utils import AttentionCGSupportInfo
@@ -256,10 +335,37 @@ class AdaptiveVerificationManager:
             capture_sizes, full_batch_shapes, replays=1
         ):
             run_dummy(**batch)
+        group = get_tp_group()
+        path = None
+        if group.rank_in_group == 0:
+            path = _cost_curve_cache_path(
+                {
+                    "schema": _COST_CURVE_SCHEMA,
+                    "capture_sizes": list(capture_sizes),
+                    "full_batch_shapes": [list(s) for s in full_batch_shapes],
+                    "max_num_reqs": self.req_states.max_num_reqs,
+                    "max_num_batched_tokens": self.req_states.max_num_batched_tokens,
+                    "num_speculative_steps": self.num_speculative_steps,
+                    "num_bonus_tokens": self.num_bonus_tokens,
+                    "context_len": envs.VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN,
+                    "world_size": group.world_size,
+                    "device": torch.cuda.get_device_name(self.req_states.device),
+                }
+            )
+        # Every rank must take the same branch: both end in a collective.
+        cached = group.broadcast_object(_load_cost_curves(path), src=0)
+        if cached is not None:
+            if path is not None:
+                logger.info("Reusing DSpark cost curves from %s", path)
+            self.set_cost_curves(
+                cached[0], cached[1], verify_curves_by_num_reqs=cached[2]
+            )
+            return
         with step_timing.collect() as timings:
             for batch in self.batches_to_profile(capture_sizes, full_batch_shapes):
                 run_dummy(**batch)
         self.set_initial_cost_curves(timings)
+        _save_cost_curves(path, getattr(self, "_profiled_cost_curves", None))
 
     def set_initial_cost_curves(self, samples: list[StepTimingSample]) -> None:
         def median_curve(
@@ -305,6 +411,11 @@ class AdaptiveVerificationManager:
             get_tp_group().broadcast_object(
                 (draft_curve, verify_curve, verify_curves_by_num_reqs), src=0
             )
+        )
+        self._profiled_cost_curves = (
+            draft_curve,
+            verify_curve,
+            verify_curves_by_num_reqs,
         )
         if not draft_curve or not verify_curve:
             raise RuntimeError(
