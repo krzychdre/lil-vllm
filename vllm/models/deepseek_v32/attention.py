@@ -41,12 +41,13 @@ from vllm.v1.attention.ops.pcp import (
     maybe_gather_mla_latent_cache_inputs,
 )
 
-# [determinism] Nakładka overlay/determinism (GLM-5.3 full, KK 20261011).
-# Zmiany bezwarunkowe, działają też w grafach CUDA FULL i PIECEWISE (żadnej
-# synchronizacji z hostem, kształty stałe w obrębie grafu). Przełączniki
-# składników czytane RAZ przy imporcie, wyłącznie diagnostyczne (domyślnie 1):
-#   VLLM_DETERMINISM_TOPK_SORT=0  -> bez kanonizacji bufora top-k (D1)
-#   VLLM_DETERMINISM_PADZERO=0    -> bez zerowania wierszy dopełnienia (D3)
+# [determinism] Run-to-run determinism patch (tested with GLM-5.3 full on the
+# Karmic Kraken image 20261011). The changes are unconditional and also work
+# inside FULL and PIECEWISE CUDA graphs (no host synchronisation, shapes fixed
+# within a graph). Per-component switches, read ONCE at import time, meant for
+# diagnosis only (default 1 = on):
+#   VLLM_DETERMINISM_TOPK_SORT=0  -> no top-k order canonicalisation
+#   VLLM_DETERMINISM_PADZERO=0    -> padding rows of the attention output not zeroed
 import os as _os
 
 _DET_TOPK_SORT = _os.environ.get("VLLM_DETERMINISM_TOPK_SORT", "1") != "0"
@@ -55,12 +56,12 @@ _DET_SORT_CHUNK = 1024
 
 
 def canonical_topk(indices: torch.Tensor) -> torch.Tensor:
-    """Ten sam zbiór, ustalona kolejność: ważne (>=0) rosnąco, potem -1.
+    """Same set, fixed order: valid indices (>= 0) ascending, then -1.
 
-    Poza miejscem; CPU i CUDA, int32/int64, bez synchronizacji z hostem.
-    Konsumenci (triton_filter_and_convert_dcp_index, CKV remap: stabilna
-    kompakcja; DCP1: prefiks [0, count)) przyjmują dowolną kolejność, a ten
-    układ zachowuje regułę "ważne na początku, -1 na końcu".
+    Out of place; CPU and CUDA, int32/int64, no host synchronisation.
+    The consumers (triton_filter_and_convert_dcp_index and the CKV remap do a
+    stable compaction; with DCP1 the prefix [0, count) is used) accept any
+    order, and this layout keeps the rule "valid entries first, -1 at the end".
     """
     if indices.numel() == 0:
         return indices.clone()
@@ -71,30 +72,30 @@ def canonical_topk(indices: torch.Tensor) -> torch.Tensor:
 
 
 def _det_canonicalize_topk_rows_(buf: torch.Tensor | None, rows: int) -> None:
-    """D1: wiersze [0, rows) bufora top-k do postaci kanonicznej, w miejscu.
+    """Top-k order canonicalisation: rows [0, rows) of the top-k buffer, in place.
 
-    `rows` = liczba wierszy porcji PO dopełnieniu (stała w obrębie grafu),
-    nie liczba prawdziwych tokenów: w grafie FULL ta druga zmienia się między
-    odtworzeniami, a sortowanie wierszy dopełnienia jest nieszkodliwe.
+    `rows` is the number of rows of the batch AFTER padding (fixed within a
+    graph), not the number of real tokens: in a FULL graph the latter changes
+    between replays, and sorting padding rows is harmless.
     """
     if buf is None or rows <= 0:
         return
     rows = min(int(rows), int(buf.shape[0]))
-    # Kawałki po _DET_SORT_CHUNK wierszy: chwilowa pamięć sortowania (klucz int32,
-    # wartości int32, indeksy int64) ~35 MB zamiast ~140 MB przy porcji 4096.
-    # Grafy CUDA mają <= 256 wierszy, czyli jeden kawałek.
+    # Chunks of _DET_SORT_CHUNK rows: temporary sort memory (int32 keys, int32
+    # values, int64 indices) is ~35 MB instead of ~140 MB for a 4096-row batch.
+    # CUDA graphs have <= 256 rows, i.e. a single chunk.
     for start in range(0, rows, _DET_SORT_CHUNK):
         view = buf[start : min(start + _DET_SORT_CHUNK, rows)]
         view.copy_(canonical_topk(view))
 
 
 def _det_zero_padding_rows_(output: torch.Tensor, num_actual: int | None) -> None:
-    """D3: wiersze dopełnienia wyjścia uwagi = 0, zanim zużyje je o_proj.
+    """Padding-row zeroing: attention output padding rows = 0 before o_proj.
 
-    Maska `is_padding` z ForwardContext to trwały bufor runnera V2
-    aktualizowany co krok, więc działa w grafie FULL przy zmiennej liczbie
-    prawdziwych wierszy. Bez maski (np. szkic MTP: speculator nie podaje
-    is_padding) zostaje zerowanie wycinkiem [num_actual:].
+    The `is_padding` mask from ForwardContext is a persistent buffer of the V2
+    model runner, updated every step, so this works in a FULL graph with a
+    varying number of real rows. Without the mask (e.g. the MTP drafter: the
+    speculator does not provide is_padding) the slice [num_actual:] is zeroed.
     """
     is_padding = get_forward_context().is_padding
     if isinstance(is_padding, torch.Tensor) and is_padding.shape[0] == output.shape[0]:
@@ -615,9 +616,10 @@ class DeepseekV32Attention(MLAAttention):
                 ),
             )
             if _DET_TOPK_SORT:
-                # [determinism] D1: kolejność top-k z indeksera (atomiki fused /
-                # radix) -> kanoniczna, zanim skonsumuje ją uwaga (także warstwy S
-                # dziedziczące bufor i warstwa MTP).
+                # [determinism] Top-k order canonicalisation: the indexer's order
+                # (set by atomics in the fused and radix paths) -> canonical, before
+                # attention consumes it (also layers without their own indexer that
+                # reuse this buffer, and the MTP layer).
                 _det_canonicalize_topk_rows_(self.topk_indices_buffer, q_c.shape[0])
         self.impl.record_logical_topk_ready()  # type: ignore[attr-defined]
 
@@ -674,7 +676,7 @@ class DeepseekV32Attention(MLAAttention):
                 output,
             )
             if _DET_PADZERO:
-                _det_zero_padding_rows_(output, num_actual)  # [determinism] D3
+                _det_zero_padding_rows_(output, num_actual)  # [determinism]
             return
 
         if self._fp8_kv_needs_view:
@@ -767,6 +769,7 @@ class DeepseekV32Attention(MLAAttention):
         if self.use_pcp and num_actual < output.shape[0]:
             output[num_actual:].zero_()
         if _DET_PADZERO:
-            # [determinism] D3: wiersze dopełnienia (torch.empty, niezapisane poza
-            # PCP) = stara pamięć puli grafów, która przez o_proj szła do MoE.
+            # [determinism] Padding-row zeroing: padding rows (torch.empty, not
+            # written except with PCP) hold stale memory from the CUDA-graph pool,
+            # which went through o_proj into the MoE.
             _det_zero_padding_rows_(output, num_actual)

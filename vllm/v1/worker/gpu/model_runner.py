@@ -203,9 +203,9 @@ from vllm.v1.worker.workspace import (
 
 logger = init_logger(__name__)
 
-# [determinism] Nakładka overlay/determinism; przełącznik diagnostyczny składnika
-# czytany raz przy imporcie (domyślnie 1 = włączony):
-#   VLLM_DETERMINISM_PAD_INPUT_IDS=0 -> input_ids wierszy dopełnienia bez zerowania
+# [determinism] Run-to-run determinism patch; diagnostic switch for this
+# component, read once at import time (default 1 = on):
+#   VLLM_DETERMINISM_PAD_INPUT_IDS=0 -> input_ids of padding rows not zeroed
 _DET_PAD_INPUT_IDS = (
     __import__("os").environ.get("VLLM_DETERMINISM_PAD_INPUT_IDS", "1") != "0"
 )
@@ -1502,19 +1502,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_tokens = batch_req_state.num_tokens
         num_tokens_after_padding = max(num_tokens, batch_desc.num_tokens)
         assert num_tokens > 0
-        # [determinism] Maska dopełnienia ustawiana ZAWSZE (oryginał: tylko przy
-        # VLLM_MOE_SKIP_PADDING=1, domyślnie 1): czyta ją zerowanie wierszy
-        # dopełnienia wyjścia uwagi (deepseek_v32/attention.py, D3).
+        # [determinism] The padding mask is ALWAYS filled (originally only with
+        # VLLM_MOE_SKIP_PADDING=1, which is the default): it is read by the
+        # padding-row zeroing of the attention output (deepseek_v32/attention.py).
         # Mark trailing cudagraph-padding rows so kernels can skip work for
         # them when supported.
         is_padding = self.input_buffers.is_padding
         is_padding[:num_tokens].fill_(False)
         is_padding[num_tokens:num_tokens_after_padding].fill_(True)
         if _DET_PAD_INPUT_IDS and num_tokens_after_padding > num_tokens:
-            # [determinism] D3: wiersze dopełnienia dostają token 0 zamiast
-            # nieświeżych identyfikatorów z poprzednich kroków. Prawdziwe wiersze
-            # [0, num_tokens) zapisują niżej prepare_prefill_inputs i
-            # combine_sampled_and_draft_tokens (rozłączne zakresy).
+            # [determinism] Padding rows get token id 0 instead of stale ids
+            # left over from earlier steps. The real rows [0, num_tokens) are
+            # written further down by prepare_prefill_inputs and
+            # combine_sampled_and_draft_tokens (disjoint ranges).
             self.input_buffers.input_ids[num_tokens:num_tokens_after_padding].zero_()
 
         req_ids = batch_req_state.req_ids
