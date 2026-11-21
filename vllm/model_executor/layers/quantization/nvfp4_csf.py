@@ -3,6 +3,7 @@
 """Lossless NVFP4 expert scale storage with native ModelOpt arithmetic."""
 
 import itertools
+import os
 from dataclasses import dataclass, field, replace
 
 import regex as re
@@ -241,13 +242,26 @@ class Nvfp4CsfMoEMethod(FusedMoEMethodBase):
                     # projection's fixed plane flat; the B12X source wants
                     # 16-row groups of 16 base bytes plus the packed scale bits.
                     parts["fixed"] = parts["fixed"].view(rows // 16, -1)
+                # Every rank stages the projection's whole compressed plane;
+                # the rank's slice is metadata until process_weights_after_loading
+                # converts it, and that runs only after the last layer loads.
+                # For slab checkpoints at TP6 (GLM-5.3 full) the planes of all
+                # layers are 21.7 GiB per GPU, which exceeds the room left
+                # beside the weights. Keep them in host memory until their
+                # layer is prepared (CsfSource supports host-resident planes).
+                staging = (
+                    torch.device("cpu")
+                    if self.encoding == "csf"
+                    and os.environ.get("VLLM_NVFP4_CSF_HOST_STAGING", "1") != "0"
+                    else param.device
+                )
                 values["scales"] = stage_csf_sources(
                     [tuple(parts[field] for field in fields)],
                     rows=rows,
                     columns=columns,
                     quantization="nvfp4",
                     encoding=self.encoding,
-                    device=param.device,
+                    device=staging,
                     row_range=row_slice,
                     column_range=column_slice,
                     padded_rows=out_rows,
