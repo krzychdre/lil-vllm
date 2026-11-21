@@ -236,6 +236,11 @@ class Nvfp4CsfMoEMethod(FusedMoEMethodBase):
                     if self.encoding == "csf"
                     else ("bases", "codes", "page_bases", "offsets", "exceptions")
                 )
+                if self.encoding == "csf" and parts["fixed"].ndim == 1:
+                    # Slab checkpoints (GLM-5.3-NVFP4-CSF) store each
+                    # projection's fixed plane flat; the B12X source wants
+                    # 16-row groups of 16 base bytes plus the packed scale bits.
+                    parts["fixed"] = parts["fixed"].view(rows // 16, -1)
                 values["scales"] = stage_csf_sources(
                     [tuple(parts[field] for field in fields)],
                     rows=rows,
