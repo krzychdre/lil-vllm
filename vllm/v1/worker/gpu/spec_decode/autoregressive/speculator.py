@@ -25,9 +25,9 @@ from vllm.v1.worker.utils import AttentionGroup, get_uniform_decode_token_count
 
 logger = init_logger(__name__)
 
-# [determinism] Nakładka overlay/determinism; przełącznik diagnostyczny składnika
-# czytany raz przy imporcie (domyślnie 1 = włączony):
-#   VLLM_DETERMINISM_PAD_INPUT_IDS=0 -> input_ids wierszy dopełnienia bez zerowania
+# [determinism] Run-to-run determinism patch; diagnostic switch for this
+# component, read once at import time (default 1 = on):
+#   VLLM_DETERMINISM_PAD_INPUT_IDS=0 -> input_ids of padding rows not zeroed
 _DET_PAD_INPUT_IDS = (
     __import__("os").environ.get("VLLM_DETERMINISM_PAD_INPUT_IDS", "1") != "0"
 )
@@ -309,9 +309,9 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         )
 
         if _DET_PAD_INPUT_IDS and num_tokens_padded > num_tokens:
-            # [determinism] D3/D5: wiersze dopełnienia szkicu MTP dostają token 0
-            # zamiast nieświeżych identyfikatorów z poprzednich kroków (prawdziwe
-            # wiersze [0, num_tokens) zapisuje prepare_prefill_inputs niżej).
+            # [determinism] Padding rows of the MTP drafter get token id 0 instead
+            # of stale ids left over from earlier steps (the real rows
+            # [0, num_tokens) are written by prepare_prefill_inputs below).
             self.input_buffers.input_ids[num_tokens:num_tokens_padded].zero_()
         # Get the input ids and last token indices for the speculator.
         prepare_prefill_inputs(
