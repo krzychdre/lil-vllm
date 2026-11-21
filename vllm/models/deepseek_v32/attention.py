@@ -41,6 +41,68 @@ from vllm.v1.attention.ops.pcp import (
     maybe_gather_mla_latent_cache_inputs,
 )
 
+# [determinism] Nakładka overlay/determinism (GLM-5.3 full, KK 20261011).
+# Zmiany bezwarunkowe, działają też w grafach CUDA FULL i PIECEWISE (żadnej
+# synchronizacji z hostem, kształty stałe w obrębie grafu). Przełączniki
+# składników czytane RAZ przy imporcie, wyłącznie diagnostyczne (domyślnie 1):
+#   VLLM_DETERMINISM_TOPK_SORT=0  -> bez kanonizacji bufora top-k (D1)
+#   VLLM_DETERMINISM_PADZERO=0    -> bez zerowania wierszy dopełnienia (D3)
+import os as _os
+
+_DET_TOPK_SORT = _os.environ.get("VLLM_DETERMINISM_TOPK_SORT", "1") != "0"
+_DET_PADZERO = _os.environ.get("VLLM_DETERMINISM_PADZERO", "1") != "0"
+_DET_SORT_CHUNK = 1024
+
+
+def canonical_topk(indices: torch.Tensor) -> torch.Tensor:
+    """Ten sam zbiór, ustalona kolejność: ważne (>=0) rosnąco, potem -1.
+
+    Poza miejscem; CPU i CUDA, int32/int64, bez synchronizacji z hostem.
+    Konsumenci (triton_filter_and_convert_dcp_index, CKV remap: stabilna
+    kompakcja; DCP1: prefiks [0, count)) przyjmują dowolną kolejność, a ten
+    układ zachowuje regułę "ważne na początku, -1 na końcu".
+    """
+    if indices.numel() == 0:
+        return indices.clone()
+    big = torch.iinfo(indices.dtype).max
+    key = indices.masked_fill(indices < 0, big)
+    key = torch.sort(key, dim=-1).values
+    return key.masked_fill_(key == big, -1)
+
+
+def _det_canonicalize_topk_rows_(buf: torch.Tensor | None, rows: int) -> None:
+    """D1: wiersze [0, rows) bufora top-k do postaci kanonicznej, w miejscu.
+
+    `rows` = liczba wierszy porcji PO dopełnieniu (stała w obrębie grafu),
+    nie liczba prawdziwych tokenów: w grafie FULL ta druga zmienia się między
+    odtworzeniami, a sortowanie wierszy dopełnienia jest nieszkodliwe.
+    """
+    if buf is None or rows <= 0:
+        return
+    rows = min(int(rows), int(buf.shape[0]))
+    # Kawałki po _DET_SORT_CHUNK wierszy: chwilowa pamięć sortowania (klucz int32,
+    # wartości int32, indeksy int64) ~35 MB zamiast ~140 MB przy porcji 4096.
+    # Grafy CUDA mają <= 256 wierszy, czyli jeden kawałek.
+    for start in range(0, rows, _DET_SORT_CHUNK):
+        view = buf[start : min(start + _DET_SORT_CHUNK, rows)]
+        view.copy_(canonical_topk(view))
+
+
+def _det_zero_padding_rows_(output: torch.Tensor, num_actual: int | None) -> None:
+    """D3: wiersze dopełnienia wyjścia uwagi = 0, zanim zużyje je o_proj.
+
+    Maska `is_padding` z ForwardContext to trwały bufor runnera V2
+    aktualizowany co krok, więc działa w grafie FULL przy zmiennej liczbie
+    prawdziwych wierszy. Bez maski (np. szkic MTP: speculator nie podaje
+    is_padding) zostaje zerowanie wycinkiem [num_actual:].
+    """
+    is_padding = get_forward_context().is_padding
+    if isinstance(is_padding, torch.Tensor) and is_padding.shape[0] == output.shape[0]:
+        output.masked_fill_(is_padding.view(-1, 1), 0)
+    elif num_actual is not None and num_actual < output.shape[0]:
+        output[num_actual:].zero_()
+
+
 if TYPE_CHECKING:
     from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadata
     from vllm.v1.attention.backend import MLAAttentionImpl
@@ -552,6 +614,11 @@ class DeepseekV32Attention(MLAAttention):
                     self._vllm_config.parallel_config.cp_kv_cache_interleave_size
                 ),
             )
+            if _DET_TOPK_SORT:
+                # [determinism] D1: kolejność top-k z indeksera (atomiki fused /
+                # radix) -> kanoniczna, zanim skonsumuje ją uwaga (także warstwy S
+                # dziedziczące bufor i warstwa MTP).
+                _det_canonicalize_topk_rows_(self.topk_indices_buffer, q_c.shape[0])
         self.impl.record_logical_topk_ready()  # type: ignore[attr-defined]
 
         attn_metadata, _, kv_cache, layer_slot_mapping = get_attention_context(
@@ -606,6 +673,8 @@ class DeepseekV32Attention(MLAAttention):
                 attn_metadata,
                 output,
             )
+            if _DET_PADZERO:
+                _det_zero_padding_rows_(output, num_actual)  # [determinism] D3
             return
 
         if self._fp8_kv_needs_view:
@@ -697,3 +766,7 @@ class DeepseekV32Attention(MLAAttention):
         torch.bmm(x, self.W_UV, out=out)
         if self.use_pcp and num_actual < output.shape[0]:
             output[num_actual:].zero_()
+        if _DET_PADZERO:
+            # [determinism] D3: wiersze dopełnienia (torch.empty, niezapisane poza
+            # PCP) = stara pamięć puli grafów, która przez o_proj szła do MoE.
+            _det_zero_padding_rows_(output, num_actual)

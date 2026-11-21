@@ -25,6 +25,13 @@ from vllm.v1.worker.utils import AttentionGroup, get_uniform_decode_token_count
 
 logger = init_logger(__name__)
 
+# [determinism] Nakładka overlay/determinism; przełącznik diagnostyczny składnika
+# czytany raz przy imporcie (domyślnie 1 = włączony):
+#   VLLM_DETERMINISM_PAD_INPUT_IDS=0 -> input_ids wierszy dopełnienia bez zerowania
+_DET_PAD_INPUT_IDS = (
+    __import__("os").environ.get("VLLM_DETERMINISM_PAD_INPUT_IDS", "1") != "0"
+)
+
 
 def _sparse_full_capture_request_sizes(max_num_reqs: int) -> frozenset[int]:
     """Return power-of-two request capacities, including the configured maximum."""
@@ -301,6 +308,11 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             seeds,
         )
 
+        if _DET_PAD_INPUT_IDS and num_tokens_padded > num_tokens:
+            # [determinism] D3/D5: wiersze dopełnienia szkicu MTP dostają token 0
+            # zamiast nieświeżych identyfikatorów z poprzednich kroków (prawdziwe
+            # wiersze [0, num_tokens) zapisuje prepare_prefill_inputs niżej).
+            self.input_buffers.input_ids[num_tokens:num_tokens_padded].zero_()
         # Get the input ids and last token indices for the speculator.
         prepare_prefill_inputs(
             self.last_token_indices,

@@ -203,6 +203,13 @@ from vllm.v1.worker.workspace import (
 
 logger = init_logger(__name__)
 
+# [determinism] Nakładka overlay/determinism; przełącznik diagnostyczny składnika
+# czytany raz przy imporcie (domyślnie 1 = włączony):
+#   VLLM_DETERMINISM_PAD_INPUT_IDS=0 -> input_ids wierszy dopełnienia bez zerowania
+_DET_PAD_INPUT_IDS = (
+    __import__("os").environ.get("VLLM_DETERMINISM_PAD_INPUT_IDS", "1") != "0"
+)
+
 
 class GPUModelRunner(LoRAModelRunnerMixin):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
@@ -1495,12 +1502,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_tokens = batch_req_state.num_tokens
         num_tokens_after_padding = max(num_tokens, batch_desc.num_tokens)
         assert num_tokens > 0
-        if envs.VLLM_MOE_SKIP_PADDING:
-            # Mark trailing cudagraph-padding rows so kernels can skip work for
-            # them when supported.
-            is_padding = self.input_buffers.is_padding
-            is_padding[:num_tokens].fill_(False)
-            is_padding[num_tokens:num_tokens_after_padding].fill_(True)
+        # [determinism] Maska dopełnienia ustawiana ZAWSZE (oryginał: tylko przy
+        # VLLM_MOE_SKIP_PADDING=1, domyślnie 1): czyta ją zerowanie wierszy
+        # dopełnienia wyjścia uwagi (deepseek_v32/attention.py, D3).
+        # Mark trailing cudagraph-padding rows so kernels can skip work for
+        # them when supported.
+        is_padding = self.input_buffers.is_padding
+        is_padding[:num_tokens].fill_(False)
+        is_padding[num_tokens:num_tokens_after_padding].fill_(True)
+        if _DET_PAD_INPUT_IDS and num_tokens_after_padding > num_tokens:
+            # [determinism] D3: wiersze dopełnienia dostają token 0 zamiast
+            # nieświeżych identyfikatorów z poprzednich kroków. Prawdziwe wiersze
+            # [0, num_tokens) zapisują niżej prepare_prefill_inputs i
+            # combine_sampled_and_draft_tokens (rozłączne zakresy).
+            self.input_buffers.input_ids[num_tokens:num_tokens_after_padding].zero_()
 
         req_ids = batch_req_state.req_ids
         num_scheduled_tokens_np = batch_req_state.num_scheduled_tokens
