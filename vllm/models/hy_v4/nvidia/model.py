@@ -254,6 +254,7 @@ class HYV4Model(nn.Module):
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
+                prefix=maybe_prefix(prefix, "embed_tokens"),
             )
         else:
             self.embed_tokens = PPMissingLayer()
