@@ -23,6 +23,7 @@ from importlib import import_module
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from .nvidia.dfly import HYV4DFlyForCausalLM
     from .nvidia.model import HYV4ForCausalLM
     from .nvidia.mtp import HYV4MTP
     from .nvidia.vl_model import HYV4VLForConditionalGeneration
@@ -30,6 +31,7 @@ if TYPE_CHECKING:
 __all__ = [
     "HYV4ForCausalLM",
     "HYV4MTP",
+    "HYV4DFlyForCausalLM",
     "HYV4VLForConditionalGeneration",
 ]
 
@@ -48,6 +50,7 @@ def __getattr__(name: str) -> Any:
         # platform-specific behavior.
         "HYV4ForCausalLM": ".nvidia.model",
         "HYV4MTP": ".nvidia.mtp",
+        "HYV4DFlyForCausalLM": ".nvidia.dfly",
         "HYV4VLForConditionalGeneration": (
             ".nvidia.vl_model" if current_platform.is_cuda_alike() else ".vl_stub"
         ),

@@ -145,6 +145,7 @@ DEFAULT_BREAKABLE_CUDAGRAPH_ARCHITECTURES = frozenset(
         "GlmMoeDsaForCausalLM",
         "HYV4ForCausalLM",
         "HYV4MTPModel",
+        "HYV4DFlyModel",
         "InklingForCausalLM",
         "InklingForConditionalGeneration",
         "KimiK3ForConditionalGeneration",
@@ -781,10 +782,10 @@ class VllmConfig:
         speculative_config = self.speculative_config
         if speculative_config is None:
             return 0
-        if speculative_config.use_dflash():
-            # DFlash requires an extra lookahead slot since it uses in-fill-style
-            # decoding instead of standard next-token sampling, so it has a query
-            # for the last sampled token plus queries for each draft token.
+        if speculative_config.use_dflash() or speculative_config.use_dfly():
+            # DFlash and DFly need an extra lookahead slot: they decode in-fill
+            # style instead of standard next-token sampling, with a query for the
+            # last sampled token plus queries for each draft token.
             return self.num_speculative_tokens + 1
         if speculative_config.use_eagle() or speculative_config.uses_draft_model():
             # DSpark (covered by use_eagle) drafts a block of num_speculative_tokens
@@ -1673,7 +1674,7 @@ class VllmConfig:
                     self.speculative_config.method not in get_args(EagleModelTypes)
                     and self.speculative_config.method not in get_args(NgramGPUTypes)
                     and self.speculative_config.method != "draft_model"
-                    and self.speculative_config.method != "dspark"
+                    and self.speculative_config.method not in ("dspark", "dfly")
                 ):
                     raise ValueError(
                         "Currently, async scheduling is only supported "
@@ -1706,7 +1707,7 @@ class VllmConfig:
                 and self.speculative_config.method not in get_args(EagleModelTypes)
                 and self.speculative_config.method not in get_args(NgramGPUTypes)
                 and self.speculative_config.method != "draft_model"
-                and self.speculative_config.method != "dspark"
+                and self.speculative_config.method not in ("dspark", "dfly")
             ):
                 logger.warning_once(
                     "Async scheduling not supported with %s-based "
@@ -3104,7 +3105,7 @@ class VllmConfig:
             # own speculators.
             if (
                 speculative_config.parallel_drafting
-                and speculative_config.method not in ("dflash", "dspark")
+                and speculative_config.method not in ("dflash", "dspark", "dfly")
             ):
                 unsupported.append("parallel drafting for EAGLE speculative decoding")
 
@@ -3141,6 +3142,8 @@ class VllmConfig:
         if self.speculative_config:
             if self.speculative_config.method == "dspark":
                 unsupported.append("dspark speculative decoding")
+            if self.speculative_config.method == "dfly":
+                unsupported.append("dfly speculative decoding")
             if self.speculative_config.enable_adaptive_verification:
                 unsupported.append("adaptive draft verification")
 

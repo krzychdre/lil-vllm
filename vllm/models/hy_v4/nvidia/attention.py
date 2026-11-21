@@ -41,6 +41,7 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
 )
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
+from vllm.model_executor.model_loader.weight_utils import make_attention_sink
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 from vllm.models.hy_v4.nvidia.indexer_fusion import (
     fused_indexer_k_norm_rope,
@@ -533,13 +534,12 @@ class HYV4MLAAttention(nn.Module):
         if self.learnable_sink:
             sink_backend = self._resolve_sink_backend(kv_cache_dtype)
             enable_sink = sink_backend is not None
-            self.learnable_sink_param = nn.Parameter(
-                torch.empty(
-                    self.num_local_heads,
-                    # The kernels require fp32 sinks; the disabled path keeps
-                    # the checkpoint dtype since the value is never consumed.
-                    dtype=torch.float32 if enable_sink else torch.bfloat16,
-                )
+            # The kernels require fp32 sinks; the disabled path keeps the
+            # checkpoint dtype since the value is never consumed. The TP-shard
+            # weight loader lets AutoWeightsLoader-based models (DFly) load it.
+            self.learnable_sink_param = make_attention_sink(
+                self.num_local_heads,
+                torch.float32 if enable_sink else torch.bfloat16,
             )
             if enable_sink:
                 sinks = self.learnable_sink_param
@@ -635,6 +635,20 @@ class HYV4MLAAttention(nn.Module):
 
         if selected_cls.supports_sink():
             return selected_cls
+
+        if (
+            selected_cls.get_name() == "FLASHINFER_MLA_SPARSE_SM120"
+            and kv_cache_dtype == "fp8_ds_mla"
+        ):
+            # SM12x has no FlashMLA; FlashInfer's SM120 sparse MLA kernel takes
+            # the per-head sink once the impl forwards it.
+            from vllm.models.hy_v4_flash.nvidia.sm120 import FlashSM120SparseBackend
+
+            logger.info_once(
+                "HYV4 learnable sink enabled: using FlashInfer SM120 sparse MLA "
+                "with the sink forwarded."
+            )
+            return FlashSM120SparseBackend
 
         from .flashmla_sparse import HYV4FlashMLASparseBackend
 

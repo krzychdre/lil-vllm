@@ -45,10 +45,9 @@ def validate_runtime(vllm_config: VllmConfig) -> None:
         or vllm_config.lora_config is not None
     ):
         raise ValueError("HYV4 Flash does not support KV transfer or LoRA")
-    if vllm_config.speculative_config is not None:
-        # The DFly drafter needs upstream's speculator-config framework, which
-        # this tree does not have yet.
-        raise ValueError("HYV4 Flash speculative decoding (DFly) is not ported")
+    spec = vllm_config.speculative_config
+    if spec is not None and spec.method != "dfly":
+        raise ValueError("HYV4 Flash supports only DFly speculative decoding")
     if vllm_config.cache_config.cache_dtype not in ("auto", "bfloat16", "fp8_ds_mla"):
         raise ValueError("HYV4 Flash requires BF16 or fp8_ds_mla KV storage")
     if config.index_topk % 128 or config.index_topk < config.sliding_window:

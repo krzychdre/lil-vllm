@@ -146,7 +146,10 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
 
 
 def get_shared_kv_cache_layers(vllm_config: VllmConfig):
-    attn_layers = get_layers_from_vllm_config(vllm_config, Attention)
+    # Any attention layer may alias another layer's KV storage, MLA included
+    # (e.g. HYV4 DFly draft layers bind to target MLA layers).
+    layer_type = cast(type[Any], AttentionLayerBase)
+    attn_layers = get_layers_from_vllm_config(vllm_config, layer_type)
     return {
         layer_name: kv_tgt_layer
         for layer_name, attn_module in attn_layers.items()

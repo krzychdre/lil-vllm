@@ -69,6 +69,7 @@ MTPModelTypes = Literal[
 NgramGPUTypes = Literal["ngram_gpu"]
 DFlashModelTypes = Literal["dflash"]
 DSparkModelTypes = Literal["dspark"]
+DFlyModelTypes = Literal["dfly"]
 EagleModelTypes = Literal[
     "eagle", "eagle3", "extract_hidden_states", MTPModelTypes, DFlashModelTypes
 ]
@@ -82,6 +83,7 @@ SpeculativeMethod = Literal[
     EagleModelTypes,
     NgramGPUTypes,
     DSparkModelTypes,
+    DFlyModelTypes,
 ]
 RejectionSampleMethod = Literal["standard", "synthetic", "block"]
 DraftSampleMethod = Literal["greedy", "probabilistic"]
@@ -1213,6 +1215,13 @@ class SpeculativeConfig:
             )
             self.method = "mtp"
 
+        if self.method == "dfly" and self.model is None:
+            # DFly layers ship inside the target checkpoint; the width may come
+            # from the checkpoint, so resolve the model even without N.
+            from vllm.v1.worker.gpu.spec_decode.dfly.config import config_class_for
+
+            self.model = config_class_for(self.target_model_config).default_model(self)
+
         if self.model is None and self.num_speculative_tokens is not None:
             if self.method == "mtp":
                 if self.target_model_config is None:
@@ -1402,9 +1411,18 @@ class SpeculativeConfig:
                 # detect them. When the method is explicitly "medusa", inject
                 # model_type so MedusaConfig.from_pretrained is used instead.
                 draft_hf_overrides: HfOverrides
-                draft_hf_overrides = SpeculativeConfig.get_draft_hf_overrides(
-                    self.method, self.target_model_config.hf_overrides
-                )
+                if self.method == "dfly":
+                    from vllm.v1.worker.gpu.spec_decode.dfly.config import (
+                        config_class_for,
+                    )
+
+                    draft_hf_overrides = config_class_for(
+                        self.target_model_config
+                    ).draft_hf_overrides(self)
+                else:
+                    draft_hf_overrides = SpeculativeConfig.get_draft_hf_overrides(
+                        self.method, self.target_model_config.hf_overrides
+                    )
                 self.draft_model_config = ModelConfig(
                     model=draft_model,
                     runner="draft",
@@ -1449,7 +1467,7 @@ class SpeculativeConfig:
                         draft_hf.truncated_vocab_size = target_vocab
 
                 # Automatically detect the method
-                if self.method in ("eagle", "eagle3", "dflash", "dspark"):
+                if self.method in ("eagle", "eagle3", "dflash", "dspark", "dfly"):
                     pass
                 # examples:
                 # yuhuili/EAGLE-LLaMA3-Instruct-8B
@@ -1605,8 +1623,17 @@ class SpeculativeConfig:
                     ):
                         hf.n_predict = hf.block_size
 
-                if self.method in ("dflash", "dspark"):
+                if self.method in ("dflash", "dspark", "dfly"):
                     self.parallel_drafting = True
+
+                if self.method == "dfly":
+                    from vllm.v1.worker.gpu.spec_decode.dfly.config import (
+                        config_class_for,
+                    )
+
+                    dfly_config_cls = config_class_for(self.target_model_config)
+                    dfly_config_cls.adapt_draft_model_config(self)
+                    dfly_config_cls.resolve_num_speculative_tokens(self)
 
                 if self.num_speculative_tokens is not None and hasattr(
                     self.draft_model_config.hf_config, "num_lookahead_tokens"
@@ -1623,7 +1650,7 @@ class SpeculativeConfig:
                         # Default to max value defined in draft model config.
                         self.num_speculative_tokens = n_predict
                     elif (
-                        self.method not in ("dflash", "dspark")
+                        self.method not in ("dflash", "dspark", "dfly")
                         and self.num_speculative_tokens > n_predict
                         and self.num_speculative_tokens % n_predict != 0
                     ):
@@ -1699,6 +1726,11 @@ class SpeculativeConfig:
                         self.target_parallel_config, self.draft_tensor_parallel_size
                     )
                 )
+
+        if self.method == "dfly":
+            from vllm.v1.worker.gpu.spec_decode.dfly.config import config_class_for
+
+            config_class_for(self.target_model_config).apply_options(self)
 
         if self.index_share_for_mtp_iteration is not None:
             if self.method != "mtp" or self.draft_model_config is None:
@@ -2036,6 +2068,11 @@ class SpeculativeConfig:
         """
         num_draft_tokens = self.num_speculative_tokens
 
+        if self.use_dfly():
+            # The drafter writes its own query-block slots, which the
+            # lookahead (num_speculative_tokens + 1) already reserves.
+            return 0
+
         if self.use_dflash():
             # DFlash uses one bonus query followed by K mask queries.
             return num_draft_tokens
@@ -2095,6 +2132,9 @@ class SpeculativeConfig:
 
     def use_dspark(self) -> bool:
         return self.method == "dspark"
+
+    def use_dfly(self) -> bool:
+        return self.method == "dfly"
 
     def uses_batch_size_dynamic_speculative_decoding(self) -> bool:
         return self.num_speculative_tokens_per_batch_size is not None
