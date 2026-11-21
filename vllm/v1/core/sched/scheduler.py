@@ -861,6 +861,9 @@ class Scheduler(SchedulerInterface):
                 separate_draft_input_tokens = 1 + spec.num_speculative_tokens
             elif spec.use_dspark():
                 separate_draft_input_tokens = spec.num_speculative_tokens
+            elif spec.use_dfly():
+                # One bonus query plus N mask queries per drafted request.
+                separate_draft_input_tokens = 1 + spec.num_speculative_tokens
         draft_slots = (
             spec.max_num_new_slots_for_drafting
             if spec is not None and separate_draft_input_tokens == 0

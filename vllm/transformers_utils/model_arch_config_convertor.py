@@ -342,6 +342,7 @@ class ModelArchConfigConvertorBase:
             "bailing_hybrid_v3_mtp",
             "hy_v4",
             "hy_v4_flash",
+            "hy_v4_dfly",
             "hy_v4_mtp",
         ):
             # check is deepseek_v4 model
