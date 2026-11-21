@@ -20,8 +20,15 @@ logger = init_logger(__name__)
 
 # Architecture -> the hf_text_config field naming its n-gram layers. A model is
 # only configurable here if it actually has such layers to store.
+_FLASH_ENGRAM_ARCHITECTURES = {
+    "HYV4FlashForCausalLM",
+    "HYV4FlashVLForConditionalGeneration",
+}
+
 _NGRAM_LAYER_FIELDS = {
     "DeepseekV41ForCausalLM": "engram_layer_ids",
+    "HYV4FlashForCausalLM": "engram_layer_ids",
+    "HYV4FlashVLForConditionalGeneration": "engram_layer_ids",
     "Qwen4ExpForCausalLM": "ple_layer_ids",
     "Qwen4ExpForConditionalGeneration": "ple_layer_ids",
 }
@@ -115,6 +122,10 @@ class EngramConfig:
                 "EngramConfig requires a model with supported Engram "
                 "embeddings, non-empty n-gram layer ids, and CUDA."
             )
+        if model_config.architecture in _FLASH_ENGRAM_ARCHITECTURES:
+            for option in ("dp_shared_memory", "embedding_across_dp"):
+                if getattr(self, option):
+                    raise ValueError(f"Flash Engram does not support {option}")
 
         if self.table_memory != "disk" and self.disk_resident_scales:
             raise ValueError("disk Engram controls require table_memory='disk'")
